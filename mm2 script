@@ -1,7 +1,7 @@
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/NIcoGabrielRealYtr/Aether.lua-Library/refs/heads/main/Source"))()
 
 local MainWindow = Library:CreateWindow({
-    Title = "win",
+    Title = "osccv2",
     SubText = "MM2 Hub",
     Image = "rbxassetid://95259225424429",
     IsMobile = true
@@ -23,71 +23,67 @@ if game.PlaceId ~= MM2_PLACE_ID then
 end
 
 local autofarmEnabled = false
+local autoRoundEnabled = false
+local inRound = false
 local mapFloorY = -3
+local mapBounds = { minX = -math.huge, maxX = math.huge, minZ = -math.huge, maxZ = math.huge }
 local bottomThreshold = 0
 local antiPlayerEnabled = false
 local originalCollisions = {}
 local currentSpeed = 500
 local hoverHeight = 200
 local visitedCoins = {}
+local collectedCoins = 0
+local resetAtCoins = 40
 
 -- ========================
--- COIN DETECTION
+-- MAP BOUNDS
 -- ========================
-local function isVisited(coinPos)
-    for _, pos in ipairs(visitedCoins) do
-        if (pos - coinPos).Magnitude < 5 then return true end
-    end
-    return false
-end
-
-local function getNearestCoin(rootPos)
-    local nearest = nil
-    local shortestDist = math.huge
+local function calculateMapBounds()
+    local minX, maxX = math.huge, -math.huge
+    local minZ, maxZ = math.huge, -math.huge
+    local lowestY = math.huge
+    
     for _, v in ipairs(Workspace:GetDescendants()) do
         if v:IsA("BasePart") and v.Name:lower():find("coin") then
             if v.Parent and v.Parent.Name ~= "CoinBag" then
-                if not isVisited(v.Position) then
-                    local dist = (v.Position - rootPos).Magnitude
-                    if dist < shortestDist then
-                        shortestDist = dist
-                        nearest = v
-                    end
-                end
+                local pos = v.Position
+                if pos.X < minX then minX = pos.X end
+                if pos.X > maxX then maxX = pos.X end
+                if pos.Z < minZ then minZ = pos.Z end
+                if pos.Z > maxZ then maxZ = pos.Z end
+                if pos.Y < lowestY then lowestY = pos.Y end
             end
         end
     end
-    return nearest
+    
+    if minX ~= math.huge then
+        mapBounds.minX = minX - 30
+        mapBounds.maxX = maxX + 30
+        mapBounds.minZ = minZ - 30
+        mapBounds.maxZ = maxZ + 30
+    end
+    
+    if lowestY ~= math.huge then
+        mapFloorY = lowestY - 5
+    end
 end
 
-local function getCoinCount()
-    local count = 0
-    for _, v in ipairs(Workspace:GetDescendants()) do
-        if v:IsA("BasePart") and v.Name:lower():find("coin") then
-            if v.Parent and v.Parent.Name ~= "CoinBag" and not isVisited(v.Position) then
-                count = count + 1
-            end
-        end
+-- ========================
+-- SAFE POSITION
+-- ========================
+local function safePosition(pos)
+    if pos.Y < mapFloorY + 3 then
+        pos = Vector3.new(pos.X, mapFloorY + 5, pos.Z)
     end
-    return count
-end
-
-local function isBagFull()
-    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if playerGui then
-        for _, gui in ipairs(playerGui:GetDescendants()) do
-            if gui:IsA("TextLabel") then
-                local text = gui.Text:lower()
-                local current, max = gui.Text:match("(%d+)%s*/%s*(%d+)")
-                if current and max and tonumber(current) >= tonumber(max) then
-                    if text:find("coin") or gui.Parent.Name:lower():find("coin") or gui.Parent.Parent.Name:lower():find("coin") then
-                        return true
-                    end
-                end
-            end
-        end
+    if mapBounds.minX ~= -math.huge then
+        pos = Vector3.new(
+            math.clamp(pos.X, mapBounds.minX, mapBounds.maxX),
+            pos.Y,
+            math.clamp(pos.Z, mapBounds.minZ, mapBounds.maxZ)
+        )
     end
-    return false
+    return pos
 end
 
 -- ========================
@@ -128,11 +124,11 @@ local function protectFall(char)
     end
 end
 
-local function idleChar(char)
+local function releaseChar(char)
     local root = char:FindFirstChild("HumanoidRootPart")
     local humanoid = char:FindFirstChild("Humanoid")
     if root then
-        root.Anchored = true
+        root.Anchored = false
         root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         root.Velocity = Vector3.new(0, 0, 0)
         root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
@@ -197,17 +193,179 @@ local function stopAntiPlayerMonitor()
 end
 
 -- ========================
--- SAFE POSITION
+-- ROUND DETECTION STATE MACHINE
 -- ========================
-local function safePosition(pos)
-    if pos.Y < mapFloorY then
-        return Vector3.new(pos.X, mapFloorY + 5, pos.Z)
+local function coinsExist()
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name:lower():find("coin") then
+            if v.Parent and v.Parent.Name ~= "CoinBag" then
+                return true
+            end
+        end
     end
-    return pos
+    return false
+end
+
+local roundState = "IDLE"
+
+task.spawn(function()
+    while true do
+        if autoRoundEnabled then
+            if roundState == "IDLE" then
+                if coinsExist() then
+                    roundState = "WAITING_MAP"
+                end
+                
+            elseif roundState == "WAITING_MAP" then
+                local stable = 0
+                while autoRoundEnabled and stable < 3 do
+                    if coinsExist() then stable = stable + 1 else stable = 0 end
+                    task.wait(1)
+                end
+                
+                if autoRoundEnabled and coinsExist() then
+                    calculateMapBounds()
+                    Library:Notify({ Title = "Map loaded! Waiting 10s for timer...", Lifetime = 3 })
+                    roundState = "WAITING_TIMER"
+                else
+                    roundState = "IDLE"
+                end
+                
+            elseif roundState == "WAITING_TIMER" then
+                -- FIXED: Do absolutely nothing to the character during this phase
+                -- Let MM2 teleport you and freeze you naturally
+                local timer = 0
+                while autoRoundEnabled and timer < 10 do
+                    if not coinsExist() then break end
+                    task.wait(1)
+                    timer = timer + 1
+                end
+                
+                if autoRoundEnabled and coinsExist() then
+                    inRound = true
+                    autofarmEnabled = true
+                    collectedCoins = 0
+                    -- NOW we can start anti-void and protect fall
+                    -- because the teleport/freeze is over
+                    calculateMapBounds()
+                    startAntiVoid()
+                    local char = LocalPlayer.Character
+                    if char then protectFall(char) end
+                    if antiPlayerEnabled then setAntiPlayer(true) end
+                    Library:Notify({ Title = "Auto-Farm Activated", Lifetime = 3 })
+                    roundState = "FARMING"
+                else
+                    roundState = "IDLE"
+                end
+                
+            elseif roundState == "FARMING" then
+                if not coinsExist() then
+                    roundState = "WAITING_END"
+                end
+                
+            elseif roundState == "WAITING_END" then
+                task.wait(3)
+                if not coinsExist() then
+                    inRound = false
+                    autofarmEnabled = false
+                    stopAntiVoid()
+                    setAntiPlayer(false)
+                    local char = LocalPlayer.Character
+                    if char then releaseChar(char) end
+                    visitedCoins = {}
+                    collectedCoins = 0
+                    Library:Notify({ Title = "Round Ended - Back to lobby", Lifetime = 3 })
+                    roundState = "IDLE"
+                else
+                    roundState = "FARMING"
+                end
+            end
+        else
+            if roundState ~= "IDLE" then
+                inRound = false
+                autofarmEnabled = false
+                stopAntiVoid()
+                setAntiPlayer(false)
+                local char = LocalPlayer.Character
+                if char then releaseChar(char) end
+                visitedCoins = {}
+                collectedCoins = 0
+                roundState = "IDLE"
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ========================
+-- COIN DETECTION
+-- ========================
+local function isVisited(coinPos)
+    for _, pos in ipairs(visitedCoins) do
+        if (pos - coinPos).Magnitude < 5 then return true end
+    end
+    return false
+end
+
+local function cleanupVisited()
+    local aliveCoins = {}
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name:lower():find("coin") then
+            if v.Parent and v.Parent.Name ~= "CoinBag" then
+                table.insert(aliveCoins, v.Position)
+            end
+        end
+    end
+    
+    local cleaned = {}
+    for _, visitedPos in ipairs(visitedCoins) do
+        local stillExists = false
+        for _, alivePos in ipairs(aliveCoins) do
+            if (visitedPos - alivePos).Magnitude < 5 then
+                stillExists = true
+                break
+            end
+        end
+        if stillExists then
+            table.insert(cleaned, visitedPos)
+        end
+    end
+    visitedCoins = cleaned
+end
+
+local function getNearestUnvisitedCoin(rootPos)
+    local nearest = nil
+    local shortestDist = math.huge
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name:lower():find("coin") then
+            if v.Parent and v.Parent.Name ~= "CoinBag" then
+                if not isVisited(v.Position) then
+                    local dist = (v.Position - rootPos).Magnitude
+                    if dist < shortestDist then
+                        shortestDist = dist
+                        nearest = v
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function getUnvisitedCoinCount()
+    local count = 0
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name:lower():find("coin") then
+            if v.Parent and v.Parent.Name ~= "CoinBag" and not isVisited(v.Position) then
+                count = count + 1
+            end
+        end
+    end
+    return count
 end
 
 -- ========================
--- MOVEMENT
+-- ENHANCED MOVEMENT
 -- ========================
 local function moveToPosition(targetPos, speed)
     local char = LocalPlayer.Character
@@ -239,12 +397,18 @@ local function moveToPosition(targetPos, speed)
         
         local elapsed = os.clock() - startTime
         local alpha = math.min(elapsed / duration, 1)
-        local newPos = startPos:Lerp(safeTarget, alpha)
+        local easedAlpha = alpha * alpha * (3 - 2 * alpha)
+        
+        local newPos = startPos:Lerp(safeTarget, easedAlpha)
         newPos = safePosition(newPos)
         
+        local actualDelta = newPos - rootCheck.Position
+        local actualDist = actualDelta.Magnitude
+        local frameVelocity = actualDist > 0.01 and actualDelta.Unit * speed or Vector3.new(0, 0, 0)
+        
         rootCheck.CFrame = CFrame.new(newPos) * savedRotation
-        rootCheck.AssemblyLinearVelocity = direction * speed
-        rootCheck.Velocity = direction * speed
+        rootCheck.AssemblyLinearVelocity = frameVelocity
+        rootCheck.Velocity = frameVelocity
         
         if alpha >= 1 then break end
         RunService.Heartbeat:Wait()
@@ -260,7 +424,7 @@ local function moveToPosition(targetPos, speed)
 end
 
 -- ========================
--- COIN COLLECTION
+-- COIN COLLECTION — VERIFIED
 -- ========================
 local function collectNearestCoin()
     local char = LocalPlayer.Character
@@ -268,23 +432,45 @@ local function collectNearestCoin()
     local rootPart = char.HumanoidRootPart
     
     protectFall(char)
+    cleanupVisited()
     
-    local coin = getNearestCoin(rootPart.Position)
+    local coin = getNearestUnvisitedCoin(rootPart.Position)
     if not coin then return end
     
     local isBottom = coin.Position.Y <= bottomThreshold
-    local coinPos = safePosition(coin.CFrame.Position + Vector3.new(0, 3, 0))
-    local airPos = Vector3.new(coinPos.X, hoverHeight, coinPos.Z)
+    local coinPos = coin.CFrame.Position
+    local grabPos = safePosition(coinPos + Vector3.new(0, 3, 0))
+    local hoverPos = safePosition(Vector3.new(coinPos.X, hoverHeight, coinPos.Z))
     
     table.insert(visitedCoins, coin.Position)
     
-    moveToPosition(coinPos, currentSpeed)
-    task.wait(0.03)
-    moveToPosition(airPos, currentSpeed)
+    moveToPosition(grabPos, currentSpeed)
+    task.wait(0.12)
     
-    if isBottom then
-        Library:Notify({ Title = "Grabbed bottom coin!", Lifetime = 1 })
+    local wasCollected = false
+    if not coin or not coin.Parent then
+        wasCollected = true
+    elseif coin.Parent.Name == "CoinBag" then
+        wasCollected = true
     end
+    
+    if wasCollected then
+        collectedCoins = collectedCoins + 1
+        if isBottom then
+            Library:Notify({ Title = "Grabbed bottom coin! (" .. collectedCoins .. "/" .. resetAtCoins .. ")", Lifetime = 1 })
+        else
+            Library:Notify({ Title = "Coin " .. collectedCoins .. "/" .. resetAtCoins, Lifetime = 1 })
+        end
+    else
+        for i, pos in ipairs(visitedCoins) do
+            if (pos - coinPos).Magnitude < 5 then
+                table.remove(visitedCoins, i)
+                break
+            end
+        end
+    end
+    
+    moveToPosition(hoverPos, currentSpeed)
     
     local rootCheck = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if rootCheck then
@@ -305,10 +491,10 @@ local function startAntiVoid()
         if char and char:FindFirstChild("HumanoidRootPart") then
             local rootPart = char.HumanoidRootPart
             if rootPart.Anchored then return end
-            local rootPos = rootPart.Position
-            if rootPos.Y < mapFloorY then
+            local correctedPos = safePosition(rootPart.Position)
+            if correctedPos ~= rootPart.Position then
                 local savedRot = rootPart.CFrame - rootPart.Position
-                rootPart.CFrame = CFrame.new(rootPos.X, mapFloorY + 15, rootPos.Z) * savedRot
+                rootPart.CFrame = CFrame.new(correctedPos) * savedRot
                 rootPart.AssemblyLinearVelocity = Vector3.new(0, 100, 0)
                 protectFall(char)
             end
@@ -331,32 +517,65 @@ task.spawn(function()
         if autofarmEnabled then
             local char = LocalPlayer.Character
             if char and char:FindFirstChild("HumanoidRootPart") then
-                if isBagFull() then
-                    Library:Notify({ Title = "Bag Full - Resetting", Lifetime = 3 })
+                if collectedCoins >= resetAtCoins then
+                    Library:Notify({ Title = resetAtCoins .. " coins collected! Force resetting...", Lifetime = 3 })
                     visitedCoins = {}
+                    collectedCoins = 0
                     forceReset()
                     task.wait(1)
                     waitForRespawn()
                     if autofarmEnabled then
                         visitedCoins = {}
-                        Library:Notify({ Title = "New Round - Resuming", Lifetime = 2 })
+                        calculateMapBounds()
+                        Library:Notify({ Title = "Respawned - Resuming farm", Lifetime = 2 })
                     end
                 else
-                    if getCoinCount() > 0 then
+                    local unvisitedCount = getUnvisitedCoinCount()
+                    
+                    if unvisitedCount > 0 then
                         collectNearestCoin()
                     else
-                        local root = char:FindFirstChild("HumanoidRootPart")
-                        if root then
-                            local hoverPos = Vector3.new(root.Position.X, hoverHeight, root.Position.Z)
-                            if math.abs(root.Position.Y - hoverHeight) > 5 then
-                                root.Anchored = false
-                                moveToPosition(hoverPos, currentSpeed)
+                        if coinsExist() then
+                            cleanupVisited()
+                            if getUnvisitedCoinCount() > 0 then
+                                collectNearestCoin()
+                            else
+                                local root = char:FindFirstChild("HumanoidRootPart")
+                                if root then
+                                    local centerX = (mapBounds.minX + mapBounds.maxX) / 2
+                                    local centerZ = (mapBounds.minZ + mapBounds.maxZ) / 2
+                                    if centerX ~= -math.huge then
+                                        local hoverPos = safePosition(Vector3.new(centerX, hoverHeight, centerZ))
+                                        if (root.Position - hoverPos).Magnitude > 10 then
+                                            root.Anchored = false
+                                            moveToPosition(hoverPos, currentSpeed)
+                                        end
+                                        root.Anchored = true
+                                    end
+                                end
+                                while autofarmEnabled and getUnvisitedCoinCount() == 0 do
+                                    cleanupVisited()
+                                    task.wait(0.5)
+                                end
                             end
-                            root.Anchored = true
-                        end
-                        visitedCoins = {}
-                        while autofarmEnabled and getCoinCount() == 0 do
-                            task.wait(0.1)
+                        else
+                            visitedCoins = {}
+                            local root = char:FindFirstChild("HumanoidRootPart")
+                            if root then
+                                local centerX = (mapBounds.minX + mapBounds.maxX) / 2
+                                local centerZ = (mapBounds.minZ + mapBounds.maxZ) / 2
+                                if centerX ~= -math.huge then
+                                    local hoverPos = safePosition(Vector3.new(centerX, hoverHeight, centerZ))
+                                    if (root.Position - hoverPos).Magnitude > 10 then
+                                        root.Anchored = false
+                                        moveToPosition(hoverPos, currentSpeed)
+                                    end
+                                    root.Anchored = true
+                                end
+                            end
+                            while autofarmEnabled and getUnvisitedCoinCount() == 0 do
+                                task.wait(0.5)
+                            end
                         end
                     end
                 end
@@ -524,12 +743,35 @@ local FarmSection = MM2Tab:AddSection({
 })
 
 FarmSection:AddToggle({
-    Text = "Coin Auto-Farm",
+    Text = "Auto-Farm on Round Start",
+    Flag = "auto_round",
+    Default = false,
+    Callback = function(value)
+        autoRoundEnabled = value
+        if value then
+            roundState = "IDLE"
+            Library:Notify({ Title = "Auto-Round Enabled - AFK in lobby", Lifetime = 3 })
+        else
+            autofarmEnabled = false
+            inRound = false
+            roundState = "IDLE"
+            stopAntiVoid()
+            setAntiPlayer(false)
+            local char = LocalPlayer.Character
+            if char then releaseChar(char) end
+            Library:Notify({ Title = "Auto-Round Disabled", Lifetime = 2 })
+        end
+    end
+})
+
+FarmSection:AddToggle({
+    Text = "Coin Auto-Farm (Manual)",
     Flag = "coin_autofarm",
     Default = false,
     Callback = function(value)
         autofarmEnabled = value
         if value then
+            calculateMapBounds()
             startAntiVoid()
             local char = LocalPlayer.Character
             if char then protectFall(char) end
@@ -539,11 +781,7 @@ FarmSection:AddToggle({
             stopAntiVoid()
             setAntiPlayer(false)
             local char = LocalPlayer.Character
-            if char then
-                local root = char:FindFirstChild("HumanoidRootPart")
-                if root then root.Anchored = false end
-                idleChar(char)
-            end
+            if char then releaseChar(char) end
             Library:Notify({ Title = "Auto-Farm Disabled", Lifetime = 2 })
         end
     end
@@ -591,22 +829,39 @@ FarmSection:AddSlider({
     end
 })
 
+FarmSection:AddSlider({
+    Text = "Reset at Coins",
+    Flag = "reset_coins",
+    Min = 10,
+    Max = 100,
+    Default = 40,
+    Suffix = " coins",
+    Callback = function(value)
+        resetAtCoins = value
+    end
+})
+
 FarmSection:AddButton({
     Text = "Collect Coins Once",
     Callback = function()
         local char = LocalPlayer.Character
         if char and char:FindFirstChild("HumanoidRootPart") then
+            calculateMapBounds()
             startAntiVoid()
             protectFall(char)
-            while getCoinCount() > 0 do
+            while getUnvisitedCoinCount() > 0 do
                 collectNearestCoin()
             end
             local root = char:FindFirstChild("HumanoidRootPart")
             if root then
-                local hoverPos = Vector3.new(root.Position.X, hoverHeight, root.Position.Z)
-                root.Anchored = false
-                moveToPosition(hoverPos, currentSpeed)
-                root.Anchored = true
+                local centerX = (mapBounds.minX + mapBounds.maxX) / 2
+                local centerZ = (mapBounds.minZ + mapBounds.maxZ) / 2
+                if centerX ~= -math.huge then
+                    local hoverPos = safePosition(Vector3.new(centerX, hoverHeight, centerZ))
+                    root.Anchored = false
+                    moveToPosition(hoverPos, currentSpeed)
+                    root.Anchored = true
+                end
             end
             stopAntiVoid()
             Library:Notify({ Title = "Coins Collected", Lifetime = 2 })
@@ -812,14 +1067,14 @@ UISettingsSection:AddButton({
     Text = "Unload Script",
     Callback = function()
         autofarmEnabled = false
+        autoRoundEnabled = false
+        inRound = false
+        roundState = "IDLE"
         stopAntiVoid()
         stopAntiPlayerMonitor()
         setAntiPlayer(false)
         local char = LocalPlayer.Character
-        if char then
-            local root = char:FindFirstChild("HumanoidRootPart")
-            if root then root.Anchored = false end
-        end
+        if char then releaseChar(char) end
         for _, player in ipairs(Players:GetPlayers()) do
             removeESP(player)
         end
@@ -830,6 +1085,6 @@ UISettingsSection:AddButton({
 })
 
 Library:Notify({
-    Title = "win loaded!",
+    Title = "osccv2 loaded!",
     Lifetime = 3
 })
